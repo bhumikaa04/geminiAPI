@@ -1,392 +1,668 @@
-"use client";
-import React, { useState, useRef, useEffect } from "react";
+/* ==============================================================
+  UPDATED APP FILE (chat.jsx)
+  
+  FIX: Re-implemented client-side filter (where('creatorId', '==', googleUID))
+  in the chat loading useEffect to ensure only the user's chats are read.
+  
+  Note: This fix assumes the Firestore composite index (creatorId, createdAt) 
+  has been successfully created in your Firebase project.
+==============================================================
+*/
 
-/**
- * Chat.jsx
- * - Fixed to fit perfectly on laptop screen without extra scrolling
- */
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { initializeApp, getApp } from 'firebase/app';
+import {
+    getAuth,
+    signInAnonymously,
+    signInWithCustomToken,
+    onAuthStateChanged,
+    signOut
+} from 'firebase/auth';
+import {
+    getFirestore,
+    doc,
+    addDoc,
+    collection,
+    query,
+    onSnapshot,
+    Timestamp,
+    setDoc,
+    deleteDoc,
+    orderBy,
+    where // <-- IMPORTANT: ADDED 'where' IMPORT HERE
+} from 'firebase/firestore';
+import { Send, LogOut, MessageSquare, Plus, Zap, MoreVertical, Trash2, AlertCircle } from 'lucide-react';
 
-const API_BASE = "http://localhost:3000";
+/* ==============================================================
+  GLOBAL CONFIG (same as before)
+==============================================================
+*/
 
-function formatTime(date = new Date()) {
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
-export default function Chat() {
-  const [prompt, setPrompt] = useState("");
-  const [messages, setMessages] = useState([
-    {
-      sender: "bot",
-      text: "Hi — I'm Gemini. Ask me anything ✨",
-      time: formatTime(),
-    },
-  ]);
-  const [loading, setLoading] = useState(false);
-  const [placeholderIndex, setPlaceholderIndex] = useState(0);
-  const textareaRef = useRef(null);
-  const endRef = useRef(null);
+const FALLBACK_FIREBASE_CONFIG = {
+    apiKey: "AIzaSyA0x1DbzFdErh5PAeg9sequydSaT8QVrwg",
+    authDomain: "multi-chatiing.firebaseapp.com",
+    projectId: "multi-chatiing",
+    storageBucket: "multi-chatiing.firebasestorage.app",
+    messagingSenderId: "279820353236",
+    appId: "1:279820353236:web:684c07fae198cc8cd0c541",
+};
 
-  const placeholders = [
-    "What's the first rule of Fight Club?",
-    "Write a Javascript method to reverse a string",
-    "How to assemble your own PC?",
-    "Explain recursion like I'm 5",
-    "Give me a 3-step plan to learn DS in 2 months",
-  ];
-
-  // rotate placeholder every 3.5s
-  useEffect(() => {
-    const t = setInterval(
-      () => setPlaceholderIndex((i) => (i + 1) % placeholders.length),
-      3500
-    );
-    return () => clearInterval(t);
-  }, []);
-
-  // scroll to bottom on messages change
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading]);
-
-  // auto-resize textarea
-  useEffect(() => {
-    const ta = textareaRef.current;
-    if (!ta) return;
-    ta.style.height = "auto";
-    ta.style.height = Math.min(ta.scrollHeight, 144) + "px"; // Max height 144px (6 lines)
-  }, [prompt]);
-
-  const appendMessage = (msg) =>
-    setMessages((prev) => [...prev, { ...msg, time: formatTime() }]);
-
-  const handleSend = async () => {
-    const trimmed = prompt.trim();
-    if (!trimmed || loading) return;
-
-    // push user message
-    appendMessage({ sender: "user", text: trimmed });
-    setPrompt("");
-    setLoading(true);
-
-    try {
-      const res = await fetch(`${API_BASE}/api/content`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: trimmed }),
-      });
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text || "Server error");
-      }
-
-      const data = await res.json();
-      appendMessage({
-        sender: "bot",
-        text: data.result || "No response (empty)",
-      });
-    } catch (err) {
-      console.error(err);
-      appendMessage({
-        sender: "bot",
-        text:
-          "❌ Something went wrong. Check server logs or your backend. (" +
-          (err.message || "unknown") +
-          ")",
-      });
-    } finally {
-      setLoading(false);
+const firebaseConfig = (() => {
+    if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+        try {
+            const config = JSON.parse(__firebase_config);
+            if (Object.keys(config).length > 0) return config;
+        } catch {}
     }
-  };
+    return FALLBACK_FIREBASE_CONFIG;
+})();
 
-  const handleKeyDown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
+const initialAuthToken =
+    typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+const PUBLIC_DATA_ROOT = `artifacts/${appId}/public/data`;
+
+const withRetry = async (fn, maxRetries = 5, delay = 1000) => {
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            return await fn();
+        } catch (error) {
+            if (i === maxRetries - 1) throw error;
+            await new Promise((res) => setTimeout(res, delay));
+            delay *= 2;
+        }
     }
-  };
+};
+
+const NEW_CHAT_ID = 'new-draft';
+
+/* ==============================================================
+  COMPONENT
+==============================================================
+*/
+
+const App = ({ user, onSignOut }) => {
+
+    const googleName = user?.displayName || "User";
+    const googleUID = user?.uid;
+    const googlePhoto = user?.photoURL || null;
+
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+
+    const [chats, setChats] = useState([]);
+    const [selectedChatId, setSelectedChatId] = useState(NEW_CHAT_ID); 
+    const [messages, setMessages] = useState([]);
+
+    const [newMessageText, setNewMessageText] = useState('');
+    const [loadingState, setLoadingState] = useState('Initializing...');
+    const [localError, setLocalError] = useState(null);
+    const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+    const [isGenerating, setIsGenerating] = useState(false);
+    const [hoveredChatId, setHoveredChatId] = useState(null);
+    const [showDeleteMenu, setShowDeleteMenu] = useState(null);
+
+    const messagesEndRef = useRef(null);
+
+    // Changed endpoint back to generic /api/content for external hosting compatibility
+    const GEMINI_API_ENDPOINT = 'http://localhost:3000/api/content'; 
+
+    /* ==============================================================
+      INIT FIREBASE 
+    ==============================================================
+    */
+
+    useEffect(() => {
+        const initializeFirebase = async () => {
+            try {
+                setLoadingState('Initializing Firebase...');
+                
+                let app;
+                try {
+                    app = initializeApp(firebaseConfig);
+                } catch (error) {
+                    if (error.code === 'app/duplicate-app') {
+                        app = getApp();
+                    } else {
+                        throw error;
+                    }
+                }
+
+                const firestore = getFirestore(app);
+                const firebaseAuth = getAuth(app);
+
+                setDb(firestore);
+                setAuth(firebaseAuth);
+
+                if (!googleUID) {
+                    await withRetry(async () => {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(firebaseAuth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(firebaseAuth);
+                        }
+                    });
+                }
+                
+                onAuthStateChanged(firebaseAuth, (user) => {
+                    setIsAuthReady(true);
+                    setLoadingState(null);
+                    // Clear data if user logs out or changes
+                    if (!user) {
+                        setChats([]);
+                        setMessages([]);
+                        setSelectedChatId(NEW_CHAT_ID);
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase init error:", error);
+                setLocalError(`Firebase Error: ${error.message}`);
+                setLoadingState(`Initialization Error: ${error.message}`);
+            }
+        };
+
+        initializeFirebase();
+    }, [googleUID]);
+
+    /* ==============================================================
+      LOAD CHATS & MESSAGES (FIX APPLIED HERE)
+    ==============================================================
+    */
+
+    useEffect(() => {
+        // Only attempt to load chats if authentication is ready AND we have a UID
+        if (!isAuthReady || !db || !googleUID) {
+            if (isAuthReady && !googleUID) {
+                 // This case should not happen if user object is passed correctly, but handled defensively
+                setLocalError("Cannot load chats: User ID not available.");
+            }
+            return;
+        }
+
+        const chatsRef = collection(db, `${PUBLIC_DATA_ROOT}/chats`);
+        
+        // --- FIX: Filter chats by the current user's creatorId ---
+        const q = query(
+            chatsRef, 
+            where('creatorId', '==', googleUID), // <-- The crucial filter
+            orderBy('createdAt', 'desc')
+        );
+
+        const unsubscribe = onSnapshot(q, 
+            (snapshot) => {
+                const userChats = snapshot.docs.map((d) => ({ 
+                    id: d.id, 
+                    ...d.data(),
+                    createdAt: d.data().createdAt?.toDate?.() || null
+                }));
+                setChats(userChats);
+                setLocalError(null);
+            },
+            (error) => {
+                console.error("Error loading chats:", error.code, error.message);
+                if (error.code === 'permission-denied' || error.code === 'unavailable') {
+                    setLocalError(`Failed to load chats: ${error.message}. Ensure your database rules and composite index (creatorId, createdAt) are correct.`);
+                } else {
+                    setLocalError(`Failed to load chats: ${error.message}`);
+                }
+                setChats([]);
+            }
+        );
+        return unsubscribe;
+    }, [isAuthReady, db, googleUID]); // Depend on googleUID to re-run when user changes
+
+    useEffect(() => {
+        if (!selectedChatId || selectedChatId === NEW_CHAT_ID || !db) {
+            setMessages([]);
+            return;
+        }
+
+        const msgRef = collection(db, `${PUBLIC_DATA_ROOT}/chats/${selectedChatId}/messages`);
+        const q = query(msgRef, orderBy("timestamp"));
+
+        return onSnapshot(q, (snap) => {
+            setMessages(
+                snap.docs.map((d) => ({
+                    id: d.id,
+                    ...d.data(),
+                    timestamp: d.data().timestamp?.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                }))
+            );
+        });
+    }, [selectedChatId, db]);
+
+    // Autoscroll effect
+    useEffect(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }, [messages]);
+
+
+    /* ==============================================================
+      CHAT ACTIONS (NO CHANGES)
+    ==============================================================
+    */
+
+    const handleNewChat = () => {
+        setSelectedChatId(NEW_CHAT_ID);
+        setMessages([]); 
+        setLocalError(null);
+        setShowDeleteMenu(null); // Clear delete menu
+    };
+
+    const handleSendMessage = async (e) => {
+        e.preventDefault();
+        
+        if (!newMessageText.trim() || !db || !googleUID) {
+            setLocalError("Message or connection invalid.");
+            return;
+        }
+
+        const userText = newMessageText.trim();
+        setNewMessageText('');
+        setLocalError(null);
+        setIsGenerating(true);
+
+        let currentChatId = selectedChatId;
+
+        try {
+            if (currentChatId === NEW_CHAT_ID) {
+                const newId = `chat-${crypto.randomUUID().substring(0, 8)}`;
+                
+                const chatDoc = doc(db, `${PUBLIC_DATA_ROOT}/chats/${newId}`);
+                await setDoc(chatDoc, {
+                    name: userText.substring(0, 40) + (userText.length > 40 ? '...' : ''),
+                    creatorId: googleUID, // Critical: Set creatorId
+                    creatorName: googleName,
+                    creatorPhoto: googlePhoto,
+                    createdAt: Timestamp.now(),
+                    updatedAt: Timestamp.now(),
+                });
+                
+                currentChatId = newId; 
+                setSelectedChatId(newId); 
+            }
+
+            const messagesRef = collection(db, `${PUBLIC_DATA_ROOT}/chats/${currentChatId}/messages`);
+
+            // 1. Add user message
+            await addDoc(messagesRef, {
+                text: userText,
+                senderId: googleUID,
+                senderName: googleName,
+                senderPhoto: googlePhoto, 
+                timestamp: Timestamp.now(),
+            });
+            
+            // 2. Get AI response
+            let aiResponse;
+            try {
+                const res = await fetch(GEMINI_API_ENDPOINT, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ question: userText })
+                });
+
+                if (!res.ok) {
+                    const errorText = await res.text();
+                    throw new Error(`API error ${res.status}: ${errorText}`);
+                }
+                
+                const data = await res.json();
+                aiResponse = data.result || "No response content received";
+                
+            } catch (apiError) {
+                console.error("AI API failed:", apiError);
+                aiResponse = `I'm currently unavailable. Error: ${apiError.message}`;
+            }
+
+            // 3. Add AI response
+            await addDoc(messagesRef, {
+                text: aiResponse,
+                senderId: "gemini", 
+                senderName: "ChatBot AI",
+                timestamp: Timestamp.now(),
+            });
+
+        } catch (error) {
+            console.error("Send message error:", error);
+            setLocalError(`Failed to send message: ${error.message}`);
+        } finally {
+            setIsGenerating(false);
+        }
+    };
+
+    const handleDeleteChat = async (chatId) => {
+        try {
+            await deleteDoc(doc(db, `${PUBLIC_DATA_ROOT}/chats/${chatId}`));
+            setLocalError(null);
+            setShowDeleteMenu(null);
+            
+            if (chatId === selectedChatId) {
+                setSelectedChatId(NEW_CHAT_ID);
+            }
+        } catch (error) {
+            console.error("Failed to delete chat:", error);
+            setLocalError(`Failed to delete chat: ${error.message}`);
+        }
+    };
+
+    /* ==============================================================
+      MESSAGE BUBBLE (STYLING AS PROVIDED)
+    ==============================================================
+    */
+
+    const MessageBubble = ({ message }) => {
+        const isMe = message.senderId === googleUID;
+        const isBot = message.senderId === 'gemini';
+        
+        const avatarElement = (
+            <div className={`w-8 h-8 rounded-full flex items-center justify-center text-white text-sm font-bold border-2 ${isMe ? 'bg-purple-500 border-purple-300' : 'bg-blue-600 border-blue-300'}`}>
+                {isBot ? <Zap className="w-4 h-4" /> : 
+                   (isMe && googlePhoto ? <img src={googlePhoto} alt={message.senderName} className="w-full h-full rounded-full" /> : 
+                   message.senderName[0])
+                }
+            </div>
+        );
+
+        return (
+            <div className={`flex mb-4 ${isMe ? "justify-end" : "justify-start"}`}>
+                <div className={`flex items-start max-w-3/4 ${isMe ? "flex-row-reverse" : "flex-row"}`}>
+                    
+                    {/* Avatar */}
+                    <div className={`${isMe ? 'ml-3' : 'mr-3'} mt-1`}>
+                        {avatarElement}
+                    </div>
+                    
+                    {/* Message Content */}
+                    <div className={`
+                        p-3 rounded-xl shadow-md transition-all duration-300 max-w-md
+                        ${isMe 
+                            ? "bg-purple-600 text-white rounded-br-none" 
+                            : "bg-gray-200 text-gray-800 rounded-tl-none border border-gray-300"}
+                    `}
+                    >
+                        
+                        {!isMe && (
+                            <div className="font-bold text-xs mb-1 flex items-center text-blue-800">
+                                {isBot ? 'ChatBot AI' : message.senderName}
+                            </div>
+                        )}
+                        
+                        <div className="text-sm whitespace-pre-wrap">{message.text}</div>
+                        
+                        <div className={`text-[10px] mt-1 text-right ${isMe ? 'opacity-80' : 'text-gray-500'}`}>
+                            {message.timestamp}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+    /* ==============================================================
+      CHAT ITEM COMPONENT (STYLING AS PROVIDED)
+    ==============================================================
+    */
+
+const ChatItem = ({ chat }) => {
+  const isSelected = chat.id === selectedChatId;
+  const isHovered = chat.id === hoveredChatId;
+  const isNewChatButton = chat.id === NEW_CHAT_ID;
 
   return (
-    <div className="h-screen w-screen bg-gradient-to-b from-black to-gray-900 text-gray-100 flex flex-col overflow-hidden">
-      {/* Header */}
-      <header className="flex-shrink-0 px-6 py-4 flex items-center justify-between border-b border-gray-800">
-        <div className="flex items-center gap-4">
-          {/* small sparkle svg */}
-          <div className="relative w-10 h-10">
-            <svg
-              viewBox="0 0 24 24"
-              className="w-full h-full"
-              xmlns="http://www.w3.org/2000/svg"
-            >
-              <defs>
-                <radialGradient id="g" cx="50%" cy="30%">
-                  <stop offset="0%" stopColor="#7dd3fc" stopOpacity="1" />
-                  <stop offset="100%" stopColor="#7c3aed" stopOpacity="0" />
-                </radialGradient>
-              </defs>
-              <circle cx="12" cy="12" r="10" fill="url(#g)" opacity="0.08" />
-              <g fill="none" stroke="#fff" strokeWidth="0.8" opacity="0.9">
-                <path d="M12 4 L13 9 L18 10 L13 12 L12 18 L11 12 L6 10 L11 9 Z" />
-              </g>
-            </svg>
-            {/* tiny animated sparkles */}
-            <div className="absolute inset-0 pointer-events-none">
-              <span className="animate-sparkle block w-1 h-1 bg-white rounded-full absolute left-2 top-1 opacity-80"></span>
-              <span className="animate-sparkle delay-200 block w-1.5 h-1.5 bg-white rounded-full absolute left-8 top-3 opacity-70"></span>
-              <span className="animate-sparkle delay-400 block w-1 h-1 bg-white rounded-full absolute left-5 top-8 opacity-60"></span>
-            </div>
-          </div>
-
-          <div>
-            <h1 className="text-xl md:text-2xl font-extrabold tracking-tight">
-              ChatBot
-            </h1>
-            <p className="text-xs text-gray-400 -mt-1">Gemini Chat</p>
-          </div>
-        </div>
-
-        <div className="hidden md:flex items-center gap-3">
-          <div className="text-sm text-gray-400">Model</div>
-          <div className="px-3 py-1 rounded-full bg-gray-800 text-xs text-gray-200">
-            gemini-2.5-flash
-          </div>
-        </div>
-      </header>
+    <div
+      className={`
+        relative cursor-pointer transition-all duration-200 rounded-lg overflow-visible
+        ${isSelected ? 'bg-purple-600 text-white shadow-lg' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}
+      `}
+      onMouseEnter={() => setHoveredChatId(chat.id)}
+      onMouseLeave={() => setHoveredChatId(null)}
+    >
 
       {/* Main area */}
-      <main className="flex-1 flex flex-col md:flex-row overflow-hidden">
-        {/* Left: conversation panel */}
-        <section className="flex-1 p-4 md:p-6 overflow-auto">
-          <div className="max-w-3xl mx-auto h-full">
-            <div className="space-y-4">
-              {messages.map((m, i) => (
-                <div
-                  key={i}
-                  className={`flex items-end gap-3 ${
-                    m.sender === "user" ? "justify-end" : "justify-start"
-                  }`}
-                >
-                  {m.sender === "bot" && (
-                    <div className="flex-none">
-                      <div className="w-8 h-8 rounded-full bg-gradient-to-br from-sky-500 to-indigo-600 flex items-center justify-center text-white font-semibold text-sm">
-                        AI
-                      </div>
-                    </div>
-                  )}
-
-                  <div
-                    className={`relative max-w-[80%] px-4 py-3 rounded-2xl shadow-md transform transition duration-250 ease-out
-                      ${
-                        m.sender === "user"
-                          ? "bg-gradient-to-br from-blue-600 to-blue-500 text-white rounded-br-none"
-                          : "bg-gray-800 text-gray-100 rounded-bl-none"
-                      }`}
-                    style={{
-                      animation: "fadeInUp 260ms ease both",
-                    }}
-                  >
-                    <div className="whitespace-pre-wrap break-words text-sm">{m.text}</div>
-                    <div className="text-xs text-gray-400 mt-2 text-right">
-                      {m.time}
-                    </div>
-                  </div>
-
-                  {m.sender === "user" && (
-                    <div className="flex-none">
-                      <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-600 to-pink-500 flex items-center justify-center text-white font-semibold text-sm">
-                        U
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))}
-
-              {/* loading placeholder */}
-              {loading && (
-                <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-full bg-gradient-to-br from-sky-500 to-indigo-600 flex items-center justify-center text-white text-sm">
-                    AI
-                  </div>
-                  <div className="px-4 py-3 rounded-2xl bg-gray-800 text-gray-200 max-w-[50%]">
-                    <div className="flex items-center gap-1">
-                      <span className="w-2 h-2 rounded-full bg-gray-400 animate-bounce" />
-                      <span className="w-2 h-2 rounded-full bg-gray-400 animate-bounce delay-200" />
-                      <span className="w-2 h-2 rounded-full bg-gray-400 animate-bounce delay-400" />
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              <div ref={endRef} />
-            </div>
-          </div>
-        </section>
-
-        {/* Right: quick tips / shortcuts */}
-        <aside className="w-full md:w-80 border-l border-gray-800 p-4 bg-gradient-to-b from-gray-900/50 to-transparent flex-shrink-0 overflow-auto">
-          <div className="mb-6">
-            <h3 className="text-sm text-gray-400 uppercase tracking-wide">Quick prompts</h3>
-            <div className="mt-3 space-y-2">
-              {placeholders.map((p, idx) => (
-                <button
-                  key={idx}
-                  onClick={() => {
-                    setPrompt(p);
-                    textareaRef.current?.focus();
-                  }}
-                  className="w-full text-left px-3 py-2 rounded-lg bg-gray-800 hover:bg-gray-800/80 text-xs"
-                >
-                  {p}
-                </button>
-              ))}
-            </div>
+      <button
+        onClick={() => {
+          setSelectedChatId(chat.id);
+          setShowDeleteMenu(null); // Close menu when chat is selected
+        }}
+        className="flex items-center justify-between p-3 text-left w-full"
+      >
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            {isNewChatButton && <Plus size={16} />}
+            <span className="font-medium truncate">{chat.name}</span>
           </div>
 
-          <div>
-            <h4 className="text-xs text-gray-400 uppercase">Tips</h4>
-            <ul className="mt-3 text-xs text-gray-300 space-y-1">
-              <li>• Press Enter to send, Shift+Enter for newline.</li>
-              <li>• Keep prompts short for faster responses.</li>
-              <li>• Use follow-ups for clarifications.</li>
-            </ul>
-          </div>
-        </aside>
-      </main>
-
-      {/* Composer */}
-      <footer className="flex-shrink-0 p-3 md:p-4 border-t border-gray-800 bg-gradient-to-t from-black/60 to-transparent">
-        <div className="max-w-3xl mx-auto">
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              handleSend();
-            }}
-            className="flex items-end gap-2"
-          >
-            <textarea
-              ref={textareaRef}
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder={placeholders[placeholderIndex]}
-              className="flex-1 min-h-[40px] max-h-36 resize-none px-3 py-2 rounded-xl bg-gray-800 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-sky-500 transition-shadow shadow-sm text-sm"
-              rows={1}
-            />
-
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={() => {
-                  setPrompt("");
-                  textareaRef.current?.focus();
-                }}
-                className="hidden md:inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-gray-800 hover:bg-gray-800/80 text-xs"
-                title="Clear"
-              >
-                Clear
-              </button>
-
-              <button
-                type="submit"
-                disabled={!prompt.trim() || loading}
-                className={`flex items-center gap-1 px-3 py-2 rounded-xl text-xs font-medium transition ${
-                  prompt.trim() && !loading
-                    ? "bg-indigo-600 hover:bg-indigo-700 text-white"
-                    : "bg-gray-700 text-gray-400 cursor-not-allowed"
-                }`}
-                aria-label="Send"
-              >
-                {loading ? (
-                  <>
-                    <svg
-                      className="w-3 h-3 animate-spin"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      xmlns="http://www.w3.org/2000/svg"
-                    >
-                      <circle
-                        cx="12"
-                        cy="12"
-                        r="10"
-                        stroke="currentColor"
-                        strokeWidth="4"
-                        strokeOpacity="0.15"
-                      />
-                      <path
-                        d="M22 12a10 10 0 00-10-10"
-                        stroke="currentColor"
-                        strokeWidth="4"
-                        strokeLinecap="round"
-                      />
-                    </svg>
-                    Thinking...
-                  </>
-                ) : (
-                  <>
-                    <svg
-                      className="w-3 h-3"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      xmlns="http://www.w3.org/2000/svg"
-                    >
-                      <path
-                        d="M3 12l18-9-9 18-2-7-7-2z"
-                        fill="currentColor"
-                      />
-                    </svg>
-                    Send
-                  </>
-                )}
-              </button>
+          {!isNewChatButton && (
+            <div className="text-xs opacity-70 mt-1">
+              {chat.createdAt?.toDate?.()?.toLocaleDateString() || 'Recent'}
             </div>
-          </form>
+          )}
         </div>
-      </footer>
 
-      {/* Small CSS-in-JS for animations */}
-      <style >{`
-        @keyframes fadeInUp {
-          from {
-            opacity: 0;
-            transform: translateY(6px);
-          }
-          to {
-            opacity: 1;
-            transform: translateY(0);
-          }
-        }
-        .animate-sparkle {
-          animation: sparkle 1500ms linear infinite;
-          transform-origin: center;
-          opacity: 0;
-        }
-        .animate-sparkle.delay-200 {
-          animation-delay: 200ms;
-        }
-        .animate-sparkle.delay-400 {
-          animation-delay: 400ms;
-        }
-        @keyframes sparkle {
-          0% {
-            opacity: 0;
-            transform: scale(0.6) translateY(-2px);
-          }
-          30% {
-            opacity: 1;
-            transform: scale(1.05) translateY(0);
-          }
-          100% {
-            opacity: 0;
-            transform: scale(0.6) translateY(2px);
-          }
-        }
-        .delay-200 {
-          animation-delay: 200ms;
-        }
-        .delay-400 {
-          animation-delay: 400ms;
-        }
-      `}</style>
+        {/* 3-dot button */}
+        {!isNewChatButton && (isHovered || showDeleteMenu === chat.id) && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              e.preventDefault();
+              setShowDeleteMenu(showDeleteMenu === chat.id ? null : chat.id);
+            }}
+            className={`
+              ml-2 p-2 rounded transition-colors flex-shrink-0
+              ${isSelected ? 'hover:bg-purple-700' : 'hover:bg-gray-500'}
+            `}
+          >
+            <MoreVertical size={16} />
+          </button>
+        )}
+      </button>
+
+      {/* Dropdown menu - FIXED: Changed overflow-visible and better positioning */}
+      {showDeleteMenu === chat.id && (
+        <div
+          className="absolute right-2 top-12 bg-gray-800 text-white shadow-lg rounded-md z-50 py-1 min-w-32"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              handleDeleteChat(chat.id);
+              setShowDeleteMenu(null);
+            }}
+            className="px-4 py-2 text-sm hover:bg-red-600 w-full text-left flex items-center gap-2"
+          >
+            <Trash2 size={14} />
+            Delete
+          </button>
+        </div>
+      )}
     </div>
   );
-}
+};
+
+
+    /* ==============================================================
+      UI RENDER (NO CHANGES)
+    ==============================================================
+    */
+
+    const isNewChat = selectedChatId === NEW_CHAT_ID;
+    
+    const newChatPseudoItem = { 
+        id: NEW_CHAT_ID, 
+        name: "New Chat", 
+        createdAt: null 
+    };
+
+    if (!isAuthReady || !db) {
+        return (
+            <div className="h-screen w-screen flex items-center justify-center bg-gray-100">
+                <div className="text-center p-8 bg-white rounded-xl shadow-2xl">
+                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
+                    <h2 className="text-xl font-bold text-gray-800">Initializing Chat...</h2>
+                    <p className="text-gray-600 mt-2">{loadingState}</p>
+                    {localError && (
+                        <div className="mt-4 p-3 bg-red-100 text-red-700 rounded-lg">
+                            {localError}
+                        </div>
+                    )}
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="h-screen w-screen flex flex-col bg-gray-100">
+
+            {/* TOP NAV */}
+            <header className="bg-gradient-to-r from-purple-600 to-blue-600 text-white p-4 flex justify-between items-center shadow-lg">
+                <div className="flex items-center space-x-3">
+                    {googlePhoto && <img src={googlePhoto} alt="User Profile"
+                        className="w-10 h-10 rounded-full border-2 border-white" />}
+                    <span className="font-bold text-4xl">Public Chat Hub</span>
+                </div>
+
+                <div className="text-purple-200 font-medium">Welcome, {googleName}!</div>
+
+                <button
+                    onClick={onSignOut}
+                    className="flex items-center bg-red-500 hover:bg-red-600 px-4 py-2 rounded-lg transition-colors shadow-md"
+                >
+                    <LogOut className="w-4 h-4 mr-2" />
+                    Logout
+                </button>
+            </header>
+
+            {/* DEBUG INFO */}
+            {localError && (
+                <div className="bg-red-100 border border-red-400 text-red-700 p-3 rounded-lg m-4 flex items-center">
+                    <AlertCircle className="w-5 h-5 mr-2 flex-shrink-0" />
+                    <div>
+                        <strong>Error:</strong> {localError}
+                    </div>
+                </div>
+            )}
+
+            {/* LAYOUT */}
+            <div className="flex flex-1 overflow-hidden">
+
+                {/* SIDEBAR */}
+                <div className={`
+                    bg-gray-800 text-white transition-all border-r border-gray-700
+                    ${isSidebarOpen ? "w-64" : "w-0"}
+                `}>
+                    <div className="h-full flex flex-col py-4">
+                        
+                        {/* New Chat Button */}
+                        <div className="px-4">
+                            <ChatItem chat={newChatPseudoItem} />
+                        </div>
+
+                        {/* Chat List */}
+                        <div className="flex-1 overflow-hidden flex flex-col mt-4">
+                            <h2 className="text-sm uppercase text-gray-400 border-t border-gray-700 pt-4 pb-2 px-4">
+                                Your Chats ({chats.length})
+                            </h2>
+                            
+                            {/* Scrollable chat list */}
+                            <div className="flex-1 overflow-y-auto space-y-1 px-4 scrollbar-custom">
+                                <style jsx>{`
+                                    .scrollbar-custom::-webkit-scrollbar {
+                                        width: 6px;
+                                    }
+                                    .scrollbar-custom::-webkit-scrollbar-track {
+                                        background: #374151;
+                                        border-radius: 3px;
+                                    }
+                                    .scrollbar-custom::-webkit-scrollbar-thumb {
+                                        background: #6B7280;
+                                        border-radius: 3px;
+                                    }
+                                    .scrollbar-custom::-webkit-scrollbar-thumb:hover {
+                                        background: #9CA3AF;
+                                    }
+                                `}</style>
+                                
+                                {chats.map((chat) => (
+                                    <ChatItem key={chat.id} chat={chat} />
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                {/* MAIN CHAT */}
+                <div className="flex-1 flex flex-col">
+                    
+                    {/* MESSAGES */}
+                    <div className="flex-1 overflow-y-auto p-6 bg-gradient-to-br from-gray-50 to-blue-50">
+                        {isNewChat && messages.length === 0 ? (
+                            <div className="text-center text-gray-500 mt-8">
+                                <MessageSquare className="w-16 h-16 mx-auto mb-4 opacity-50" />
+                                <p className="text-lg font-medium">Start a New Conversation</p>
+                                <p className="text-sm text-gray-400">Your chat will be saved after the first message.</p>
+                            </div>
+                        ) : messages.length === 0 && !isNewChat ? (
+                            <div className="text-center text-gray-500 mt-8">
+                                <p className="text-lg font-medium">Loading chat history...</p>
+                            </div>
+                        ) : (
+                            messages.map((msg) => (
+                                <MessageBubble key={msg.id} message={msg} />
+                            ))
+                        )}
+
+                        {isGenerating && (
+                            <div className="flex justify-start mb-4">
+                                <div className="flex items-start max-w-3/4">
+                                    <div className="mr-3 mt-1">
+                                        <div className="w-8 h-8 rounded-full flex items-center justify-center bg-blue-600 border-2 border-blue-300">
+                                            <Zap className="w-4 h-4 text-white" />
+                                        </div>
+                                    </div>
+                                    <div className="bg-gray-200 text-gray-800 p-3 rounded-xl rounded-tl-none shadow-md border border-gray-300">
+                                        <div className="flex items-center">
+                                            <div className="animate-pulse flex space-x-1">
+                                                <div className="w-2 h-2 bg-gray-500 rounded-full"></div>
+                                                <div className="w-2 h-2 bg-gray-500 rounded-full"></div>
+                                                <div className="w-2 h-2 bg-gray-500 rounded-full"></div>
+                                            </div>
+                                            <span className="ml-2 text-sm text-gray-600">AI is thinking...</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        <div ref={messagesEndRef}></div>
+                    </div>
+
+                    {/* INPUT */}
+                    <form onSubmit={handleSendMessage} className="p-4 bg-white border-t border-gray-300 flex space-x-3 shadow-lg">
+                        <input
+                            value={newMessageText}
+                            onChange={(e) => setNewMessageText(e.target.value)}
+                            className="flex-1 p-3 border-2 border-gray-300 text-black rounded-xl focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-200 transition-colors"
+                            placeholder={isNewChat ? "Type your first message to start this chat..." : "Type your message..."}
+                            disabled={isGenerating}
+                        />
+                        <button 
+                            type="submit"
+                            disabled={isGenerating || !newMessageText.trim()}
+                            className="bg-gradient-to-r from-purple-600 to-blue-600 hover:from-purple-700 hover:to-blue-700 disabled:from-gray-400 disabled:to-gray-500 text-white px-6 rounded-xl flex items-center justify-center transition-all shadow-md"
+                        >
+                            <Send className="w-4 h-4"/>
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default App;

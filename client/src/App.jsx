@@ -1,10 +1,11 @@
 import Chat from './components/chat'
+import LoginPage from './components/LoginPage'
 
 function App() {
 
   return (
     <>
-    <Chat/>
+    <LoginPage/>
     </>
   )
 }
