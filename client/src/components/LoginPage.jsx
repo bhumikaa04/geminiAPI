@@ -19,6 +19,11 @@ const LoginPage = () => {
         console.log("Setting up auth listener...");
         
         const unsubscribe = onAuthStateChanged(auth, (user) => {
+            if (user && user.photoURL) {
+                // Ensure photoURL doesn't have restrictive size parameters
+                const photoURL = user.photoURL.replace(/=s\d+(-c)?/, '=s400-c');
+                user.photoURL = photoURL;
+            }
             console.log("Auth state changed:", user ? `UID: ${user.uid}, Name: ${user.displayName}` : "no user");
             setUser(user);
             setLoading(false);
@@ -32,23 +37,25 @@ const LoginPage = () => {
         setIsLoggingIn(true);
         
         const provider = new GoogleAuthProvider();
-        // Add these to ensure we get profile data
         provider.addScope('profile');
         provider.addScope('email');
 
         try {
-            console.log("Initiating Google login popup...");
             const result = await signInWithPopup(auth, provider);
             const user = result.user;
             
-            console.log("Login successful:", {
+            // Process photoURL for better quality
+            if (user.photoURL) {
+                user.photoURL = user.photoURL.replace(/=s\d+(-c)?/, '=s400-c');
+            }
+            
+            console.log("User data:", {
                 uid: user.uid,
                 email: user.email,
                 displayName: user.displayName,
                 photoURL: user.photoURL
             });
             
-            // Force update the user state immediately
             setUser(user);
             
         } catch (err) {
@@ -73,13 +80,13 @@ const LoginPage = () => {
         try {
             await signOut(auth);
             console.log("User logged out");
+            console.log("Kindly log in");
         } catch (err) {
             console.error("Logout error:", err);
             setError("Failed to sign out. Please try again.");
         }
     };
 
-    // Show loading spinner while checking initial authentication
     if (loading) {
         return (
             <div className="min-h-screen flex items-center justify-center bg-gray-100">
@@ -91,13 +98,10 @@ const LoginPage = () => {
         );
     }
 
-    // If user exists, show chat - but ensure user has necessary data
     if (user && user.uid) {
         return <Chat user={user} onSignOut={handleLogout} />;
     }
 
-    // No user found, show login page
-    console.log("Rendering login page - no user found");
     return (
         <div className="min-h-screen flex items-center justify-center bg-gray-100">
             <div className="bg-white shadow-xl rounded-xl p-8 w-full max-w-sm text-center">
