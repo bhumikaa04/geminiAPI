@@ -13,6 +13,10 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: "whatsapp",
     },
+    expertSystem: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "ExpertSystem",
+    },
   },
   { timestamps: true }
 );
