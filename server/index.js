@@ -12,8 +12,9 @@ app.use(express.urlencoded({ extended: true }));
 app.use(
   cors({
     origin: "http://localhost:5173",
-    methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type"],
+    credentials: true, 
+    methods: ["GET", "POST" , "PUT", "PATCH", "DELETE"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
@@ -27,36 +28,27 @@ app.get("/", (req, res) => {
 });
 
 // routes
+
+app.use((req, res, next) => {
+  console.log("➡️ Incoming:", req.method, req.url);
+  next();
+});
+
+
 const contentRoutes = require("./routes/content.routes");
 app.use("/api", contentRoutes);
 
 const whatsappRoutes = require('./routes/whatsapp.routes');
 app.use('/whatsapp', whatsappRoutes);
 
-// Add this temporary route to test
-app.get('/test-user/:phone', async (req, res) => {
-  try {
-    const phone = req.params.phone;
-    const user = await User.findOne({ phone });
-    
-    if (!user) {
-      return res.json({ error: 'User not found' });
-    }
-    
-    // Check if expertSystem field exists in schema
-    const schemaPaths = Object.keys(User.schema.paths);
-    
-    res.json({
-      user,
-      hasExpertSystemField: 'expertSystem' in user,
-      expertSystemValue: user.expertSystem,
-      expertSystemInSchema: schemaPaths.includes('expertSystem'),
-      schemaPaths
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+const expertSystemRoutes = require('./routes/expertSystem.routes'); 
+app.use("/api/expert-system" , expertSystemRoutes); 
+
+app.use("/api/conversations", require("./routes/conversations.routes"));
+app.use("/api/faqs", require("./routes/faq.routes"));
+app.use("/api/ai", require("./routes/ai.routes"));
+app.use("/api/analytics", require("./routes/analytics.routes"));
+
 
 app.listen(3000, () =>
   console.log("Server running on http://localhost:3000")
