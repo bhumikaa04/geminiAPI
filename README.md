@@ -334,12 +334,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Email:** support@yourdomain.com
 - **Documentation:** [Full docs available here](https://docs.yourdomain.com)
 
-## 🌟 Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=yourusername/ai-whatsapp-assistant&type=Date)](https://star-history.com/#yourusername/ai-whatsapp-assistant&Date)
-
----
-
 <div align="center">
   
 **Ready to transform your business communication?** 🚀
